@@ -430,6 +430,384 @@ class PushRecordManager:
         return result
 
 
+# === Telegram分页状态管理 ===
+class TelegramPaginationManager:
+    """Telegram分页状态管理器"""
+    
+    def __init__(self):
+        self.pagination_dir = Path("output") / ".pagination_states"
+        self.ensure_pagination_dir()
+        self.cleanup_old_states()
+    
+    def ensure_pagination_dir(self):
+        """确保分页状态目录存在"""
+        self.pagination_dir.mkdir(parents=True, exist_ok=True)
+    
+    def get_state_file_path(self, chat_id: str, message_id: str) -> Path:
+        """获取分页状态文件路径"""
+        return self.pagination_dir / f"pagination_state_{chat_id}_{message_id}.json"
+    
+    def cleanup_old_states(self):
+        """清理过期的分页状态"""
+        pagination_config = CONFIG.get("webhooks", {}).get("telegram_pagination", {})
+        ttl_hours = pagination_config.get("session_ttl_hours", 1)
+        current_time = get_beijing_time()
+        
+        for state_file in self.pagination_dir.glob("pagination_state_*.json"):
+            try:
+                # 检查文件修改时间
+                file_mtime = datetime.fromtimestamp(state_file.stat().st_mtime)
+                file_mtime = pytz.timezone("Asia/Shanghai").localize(file_mtime)
+                
+                if (current_time - file_mtime).total_seconds() > ttl_hours * 3600:
+                    state_file.unlink()
+                    print(f"清理过期分页状态: {state_file.name}")
+            except Exception as e:
+                print(f"清理分页状态文件失败 {state_file}: {e}")
+    
+    def save_pagination_state(self, chat_id: str, message_id: str, pages: List[str], 
+                             current_page: int = 0, report_type: str = ""):
+        """保存分页状态"""
+        state_file = self.get_state_file_path(chat_id, message_id)
+        now = get_beijing_time()
+        
+        state = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "pages": pages,
+            "current_page": current_page,
+            "total_pages": len(pages),
+            "report_type": report_type,
+            "created_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "last_updated": now.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        try:
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            print(f"分页状态已保存: {chat_id}_{message_id}, {len(pages)}页")
+        except Exception as e:
+            print(f"保存分页状态失败: {e}")
+    
+    def get_pagination_state(self, chat_id: str, message_id: str) -> Optional[Dict]:
+        """获取分页状态"""
+        state_file = self.get_state_file_path(chat_id, message_id)
+        
+        if not state_file.exists():
+            return None
+        
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            return state
+        except Exception as e:
+            print(f"读取分页状态失败: {e}")
+            return None
+    
+    def update_current_page(self, chat_id: str, message_id: str, new_page: int) -> bool:
+        """更新当前页码"""
+        state = self.get_pagination_state(chat_id, message_id)
+        if not state:
+            return False
+        
+        if 0 <= new_page < state["total_pages"]:
+            state["current_page"] = new_page
+            state["last_updated"] = get_beijing_time().strftime("%Y-%m-%d %H:%M:%S")
+            
+            state_file = self.get_state_file_path(chat_id, message_id)
+            try:
+                with open(state_file, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+                return True
+            except Exception as e:
+                print(f"更新分页状态失败: {e}")
+                return False
+        return False
+    
+    def delete_pagination_state(self, chat_id: str, message_id: str):
+        """删除分页状态"""
+        state_file = self.get_state_file_path(chat_id, message_id)
+        try:
+            if state_file.exists():
+                state_file.unlink()
+                print(f"删除分页状态: {chat_id}_{message_id}")
+        except Exception as e:
+            print(f"删除分页状态失败: {e}")
+
+
+def create_telegram_inline_keyboard(current_page: int, total_pages: int, 
+                                   chat_id: str, message_id: str) -> Dict:
+    """创建Telegram InlineKeyboard分页按钮"""
+    if total_pages <= 1:
+        return {}
+    
+    keyboard = []
+    buttons = []
+    
+    # 上一页按钮
+    if current_page > 0:
+        buttons.append({
+            "text": "◀️ 上一页",
+            "callback_data": f"page_{chat_id}_{message_id}_prev"
+        })
+    
+    # 页码显示
+    page_info = f"{current_page + 1}/{total_pages}"
+    buttons.append({
+        "text": page_info,
+        "callback_data": f"page_{chat_id}_{message_id}_info"
+    })
+    
+    # 下一页按钮
+    if current_page < total_pages - 1:
+        buttons.append({
+            "text": "下一页 ▶️",
+            "callback_data": f"page_{chat_id}_{message_id}_next"
+        })
+    
+    keyboard.append(buttons)
+    
+    return {"inline_keyboard": keyboard}
+
+
+def send_telegram_message_with_pagination(bot_token: str, chat_id: str, 
+                                        pages: List[str], current_page: int,
+                                        report_type: str, proxy_url: Optional[str] = None) -> Optional[str]:
+    """发送带分页的Telegram消息"""
+    headers = {"Content-Type": "application/json"}
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    
+    # 构建消息内容
+    message_content = pages[current_page]
+    if len(pages) > 1:
+        page_header = f"<b>📄 第 {current_page + 1}/{len(pages)} 页</b>\n\n"
+        message_content = page_header + message_content
+    
+    # 构建payload
+    payload = {
+        "chat_id": chat_id,
+        "text": message_content,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    
+    # 添加分页按钮（仅在多页时）
+    if len(pages) > 1:
+        reply_markup = create_telegram_inline_keyboard(current_page, len(pages), chat_id, "")
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                message_id = str(result["result"]["message_id"])
+                print(f"Telegram分页消息发送成功，消息ID: {message_id} [{report_type}]")
+                return message_id
+            else:
+                print(f"Telegram分页消息发送失败 [{report_type}]，错误：{result.get('description')}")
+                return None
+        else:
+            print(f"Telegram分页消息发送失败 [{report_type}]，状态码：{response.status_code}")
+            return None
+    except Exception as e:
+        print(f"Telegram分页消息发送出错 [{report_type}]：{e}")
+        return None
+
+
+def edit_telegram_message_with_pagination(bot_token: str, chat_id: str, message_id: str,
+                                        pages: List[str], current_page: int,
+                                        proxy_url: Optional[str] = None) -> bool:
+    """编辑Telegram消息的分页内容"""
+    headers = {"Content-Type": "application/json"}
+    url = f"https://api.telegram.org/bot{bot_token}/editMessageText"
+    
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    
+    # 构建消息内容
+    message_content = pages[current_page]
+    if len(pages) > 1:
+        page_header = f"<b>📄 第 {current_page + 1}/{len(pages)} 页</b>\n\n"
+        message_content = page_header + message_content
+    
+    # 构建payload
+    payload = {
+        "chat_id": chat_id,
+        "message_id": int(message_id),
+        "text": message_content,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    
+    # 添加分页按钮
+    if len(pages) > 1:
+        reply_markup = create_telegram_inline_keyboard(current_page, len(pages), chat_id, message_id)
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                print(f"Telegram消息页面更新成功，页码: {current_page + 1}/{len(pages)}")
+                return True
+            else:
+                print(f"Telegram消息页面更新失败，错误：{result.get('description')}")
+                return False
+        else:
+            print(f"Telegram消息页面更新失败，状态码：{response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Telegram消息页面更新出错：{e}")
+        return False
+
+
+def handle_telegram_callback(bot_token: str, callback_query: Dict, proxy_url: Optional[str] = None) -> bool:
+    """处理Telegram回调查询（分页按钮点击）"""
+    try:
+        # 解析回调数据
+        callback_data = callback_query.get("data", "")
+        chat_id = str(callback_query["message"]["chat"]["id"])
+        message_id = str(callback_query["message"]["message_id"])
+        query_id = callback_query["id"]
+        
+        print(f"收到Telegram回调: {callback_data}, chat_id: {chat_id}, message_id: {message_id}")
+        
+        # 解析callback_data格式: page_{chat_id}_{message_id}_{action}
+        if not callback_data.startswith("page_"):
+            print(f"未识别的回调数据格式: {callback_data}")
+            return False
+        
+        parts = callback_data.split("_")
+        if len(parts) != 4:
+            print(f"回调数据格式错误: {callback_data}")
+            return False
+        
+        _, cb_chat_id, cb_message_id, action = parts
+        
+        # 验证回调数据的chat_id和message_id是否匹配
+        if cb_chat_id != chat_id or cb_message_id != message_id:
+            print(f"回调数据不匹配: callback({cb_chat_id}_{cb_message_id}) vs actual({chat_id}_{message_id})")
+            return False
+        
+        # 获取分页状态
+        pagination_manager = TelegramPaginationManager()
+        state = pagination_manager.get_pagination_state(chat_id, message_id)
+        
+        if not state:
+            print(f"未找到分页状态: {chat_id}_{message_id}")
+            # 发送提示消息
+            answer_callback_query(bot_token, query_id, "⚠️ 分页会话已过期，请重新获取数据", proxy_url)
+            return False
+        
+        current_page = state["current_page"]
+        total_pages = state["total_pages"]
+        pages = state["pages"]
+        
+        # 处理不同的操作
+        new_page = current_page
+        if action == "prev" and current_page > 0:
+            new_page = current_page - 1
+        elif action == "next" and current_page < total_pages - 1:
+            new_page = current_page + 1
+        elif action == "info":
+            # 页码信息按钮，只回应不翻页
+            answer_callback_query(bot_token, query_id, f"📄 当前第 {current_page + 1} 页，共 {total_pages} 页", proxy_url)
+            return True
+        
+        # 如果页码没有变化，只回应不更新
+        if new_page == current_page:
+            if action == "prev":
+                answer_callback_query(bot_token, query_id, "⚠️ 已经是第一页了", proxy_url)
+            elif action == "next":
+                answer_callback_query(bot_token, query_id, "⚠️ 已经是最后一页了", proxy_url)
+            return True
+        
+        # 更新消息内容
+        success = edit_telegram_message_with_pagination(
+            bot_token, chat_id, message_id, pages, new_page, proxy_url
+        )
+        
+        if success:
+            # 更新分页状态
+            pagination_manager.update_current_page(chat_id, message_id, new_page)
+            # 回应回调查询
+            answer_callback_query(bot_token, query_id, f"📄 第 {new_page + 1}/{total_pages} 页", proxy_url)
+            print(f"分页切换成功: {current_page + 1} -> {new_page + 1}")
+            return True
+        else:
+            answer_callback_query(bot_token, query_id, "❌ 页面更新失败", proxy_url)
+            return False
+            
+    except Exception as e:
+        print(f"处理Telegram回调出错: {e}")
+        return False
+
+
+def answer_callback_query(bot_token: str, query_id: str, text: str = "", 
+                         proxy_url: Optional[str] = None, show_alert: bool = False) -> bool:
+    """回应Telegram回调查询"""
+    headers = {"Content-Type": "application/json"}
+    url = f"https://api.telegram.org/bot{bot_token}/answerCallbackQuery"
+    
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    
+    payload = {
+        "callback_query_id": query_id,
+        "text": text,
+        "show_alert": show_alert
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=10)
+        return response.status_code == 200 and response.json().get("ok", False)
+    except Exception as e:
+        print(f"回应回调查询失败: {e}")
+        return False
+
+
+def setup_telegram_webhook(bot_token: str, webhook_url: str, proxy_url: Optional[str] = None) -> bool:
+    """设置Telegram Webhook（可选功能，用于接收回调）"""
+    headers = {"Content-Type": "application/json"}
+    url = f"https://api.telegram.org/bot{bot_token}/setWebhook"
+    
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+    
+    payload = {
+        "url": webhook_url,
+        "allowed_updates": ["callback_query"]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, proxies=proxies, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("ok"):
+                print(f"Telegram Webhook 设置成功: {webhook_url}")
+                return True
+            else:
+                print(f"Telegram Webhook 设置失败: {result.get('description')}")
+                return False
+        else:
+            print(f"Telegram Webhook 设置失败，状态码: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"设置Telegram Webhook出错: {e}")
+        return False
+
+
 # === 数据获取 ===
 class DataFetcher:
     """数据获取器"""
@@ -3654,7 +4032,52 @@ def send_to_telegram(
     proxy_url: Optional[str] = None,
     mode: str = "daily",
 ) -> bool:
-    """发送到Telegram（支持分批发送）"""
+    """发送到Telegram（支持分页显示）"""
+    # 检查是否启用分页功能
+    pagination_config = CONFIG.get("webhooks", {}).get("telegram_pagination", {})
+    pagination_enabled = pagination_config.get("enabled", True)
+    
+    if not pagination_enabled:
+        # 如果未启用分页，使用原来的批次发送方式
+        return send_to_telegram_legacy(bot_token, chat_id, report_data, report_type, update_info, proxy_url, mode)
+    
+    # 获取分页内容（复用原有的分批逻辑）
+    pages = split_content_into_batches(
+        report_data, "telegram", update_info, mode=mode
+    )
+    
+    print(f"Telegram消息分为 {len(pages)} 页显示 [{report_type}]")
+    
+    # 发送第一页消息
+    message_id = send_telegram_message_with_pagination(
+        bot_token, chat_id, pages, 0, report_type, proxy_url
+    )
+    
+    if message_id:
+        # 保存分页状态（仅在多页时）
+        if len(pages) > 1:
+            pagination_manager = TelegramPaginationManager()
+            pagination_manager.save_pagination_state(
+                chat_id, message_id, pages, 0, report_type
+            )
+        
+        print(f"Telegram分页消息发送完成 [{report_type}]")
+        return True
+    else:
+        print(f"Telegram分页消息发送失败 [{report_type}]")
+        return False
+
+
+def send_to_telegram_legacy(
+    bot_token: str,
+    chat_id: str,
+    report_data: Dict,
+    report_type: str,
+    update_info: Optional[Dict] = None,
+    proxy_url: Optional[str] = None,
+    mode: str = "daily",
+) -> bool:
+    """发送到Telegram（原有的分批发送方式，作为后备方案）"""
     headers = {"Content-Type": "application/json"}
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
