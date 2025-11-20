@@ -1,0 +1,42 @@
+[Unit]
+Description=TrendRadar Main Service
+Documentation=https://github.com/sansan0/TrendRadar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=trendradar
+Group=trendradar
+WorkingDirectory=/opt/trendradar
+Environment=PYTHONPATH=/opt/trendradar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trendradar/venv/bin/python main.py --start-polling
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=30
+StartLimitInterval=600
+StartLimitBurst=3
+
+# 资源限制
+MemoryMax=512M
+CPUQuota=100%
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trendradar/output
+ReadOnlyPaths=/opt/trendradar/config
+
+# 日志设置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trendradar-main
+
+[Install]
+WantedBy=multi-user.target

@@ -154,6 +154,47 @@ def show_status():
     print(f"    RUN_MODE: {run_mode}")
     print(f"    IMMEDIATE_RUN: {immediate_run}")
 
+    # 检查Polling配置和状态
+    enable_polling = os.environ.get("ENABLE_POLLING", "未设置")
+    polling_restart_delay = os.environ.get("POLLING_RESTART_DELAY", "未设置")
+    
+    print(f"  📱 Polling配置:")
+    print(f"    ENABLE_POLLING: {enable_polling}")
+    print(f"    POLLING_RESTART_DELAY: {polling_restart_delay}")
+    
+    # 检查Polling进程状态
+    polling_pid_file = "/tmp/polling.pid"
+    if Path(polling_pid_file).exists():
+        try:
+            with open(polling_pid_file, 'r') as f:
+                polling_pid = f.read().strip()
+            
+            # 检查进程是否存在
+            try:
+                os.kill(int(polling_pid), 0)  # 发送信号0检查进程是否存在
+                print(f"    ✅ Polling进程运行中 (PID: {polling_pid})")
+            except (OSError, ProcessLookupError):
+                print(f"    ❌ Polling进程已停止 (PID文件存在但进程不存在: {polling_pid})")
+        except Exception as e:
+            print(f"    ❌ 无法读取Polling PID文件: {e}")
+    else:
+        if enable_polling == "true":
+            print(f"    ❌ Polling已启用但PID文件不存在")
+        else:
+            print(f"    ℹ️ Polling服务未启用")
+    
+    # 检查Polling日志文件
+    polling_log_file = "/app/output/polling.log"
+    if Path(polling_log_file).exists():
+        try:
+            stat = Path(polling_log_file).stat()
+            size_mb = stat.st_size / (1024 * 1024)
+            print(f"    📝 Polling日志文件: {size_mb:.2f} MB")
+        except Exception as e:
+            print(f"    ❌ 无法读取Polling日志文件信息: {e}")
+    else:
+        print(f"    ℹ️ Polling日志文件不存在")
+
     # 检查配置文件
     config_files = ["/app/config/config.yaml", "/app/config/frequency_words.txt"]
     print("  📁 配置文件:")
@@ -440,12 +481,60 @@ def show_help():
     print(help_text)
 
 
+def docker_health_check():
+    """Docker健康检查函数"""
+    try:
+        # 检查主进程状态
+        try:
+            with open('/proc/1/cmdline', 'r') as f:
+                pid1_cmdline = f.read().replace('\x00', ' ').strip()
+            if "supercronic" not in pid1_cmdline.lower() and "entrypoint" not in pid1_cmdline.lower():
+                print("❌ 主进程异常")
+                sys.exit(1)
+        except Exception:
+            print("❌ 无法检查主进程")
+            sys.exit(1)
+        
+        # 检查配置文件
+        config_files = ["/app/config/config.yaml", "/app/config/frequency_words.txt"]
+        for file_path in config_files:
+            if not Path(file_path).exists():
+                print(f"❌ 配置文件缺失: {file_path}")
+                sys.exit(1)
+        
+        # 检查Polling进程（如果启用）
+        enable_polling = os.environ.get("ENABLE_POLLING", "true")
+        if enable_polling == "true":
+            polling_pid_file = "/tmp/polling.pid"
+            if Path(polling_pid_file).exists():
+                try:
+                    with open(polling_pid_file, 'r') as f:
+                        polling_pid = int(f.read().strip())
+                    os.kill(polling_pid, 0)  # 检查进程是否存在
+                except (OSError, ProcessLookupError, ValueError):
+                    print("❌ Polling进程异常")
+                    sys.exit(1)
+        
+        print("✅ 健康检查通过")
+        sys.exit(0)
+        
+    except Exception as e:
+        print(f"❌ 健康检查失败: {e}")
+        sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 2:
         show_help()
         return
 
     command = sys.argv[1]
+    
+    # 检查是否是Docker健康检查
+    if command == "status" and len(sys.argv) > 2 and sys.argv[2] == "--docker":
+        docker_health_check()
+        return
+    
     commands = {
         "run": manual_run,
         "status": show_status,

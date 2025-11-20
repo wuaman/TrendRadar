@@ -5,6 +5,14 @@ services:
       dockerfile: docker/Dockerfile
     container_name: trend-radar
     restart: unless-stopped
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "python", "/app/manage.py", "status", "--docker"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
     volumes:
       - ../config:/app/config:ro
@@ -40,5 +48,8 @@ services:
       - NTFY_TOKEN=${NTFY_TOKEN:-}
       # 运行模式
       - CRON_SCHEDULE=${CRON_SCHEDULE:-*/5 * * * *}
-      - RUN_MODE=${RUN_MODE:-cron}
+      - RUN_MODE=${RUN_MODE:-main+polling}
       - IMMEDIATE_RUN=${IMMEDIATE_RUN:-true}
+      # Telegram Polling配置
+      - ENABLE_POLLING=${ENABLE_POLLING:-true}
+      - POLLING_RESTART_DELAY=${POLLING_RESTART_DELAY:-5}

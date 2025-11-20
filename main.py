@@ -808,6 +808,243 @@ def setup_telegram_webhook(bot_token: str, webhook_url: str, proxy_url: Optional
         return False
 
 
+# === Telegram Polling 服务 ===
+class TelegramPollingService:
+    """Telegram轮询服务，用于接收分页按钮点击事件"""
+    
+    def __init__(self, bot_token: str, proxy_url: Optional[str] = None):
+        self.bot_token = bot_token
+        self.proxy_url = proxy_url
+        self.offset = 0
+        self.is_running = False
+        self.polling_interval = 2  # 轮询间隔（秒）
+        self.timeout = 10  # 长轮询超时时间
+        
+    def get_updates(self, timeout: int = None) -> List[Dict]:
+        """获取Telegram更新"""
+        headers = {"Content-Type": "application/json"}
+        url = f"https://api.telegram.org/bot{self.bot_token}/getUpdates"
+        
+        proxies = None
+        if self.proxy_url:
+            proxies = {"http": self.proxy_url, "https": self.proxy_url}
+        
+        params = {
+            "offset": self.offset,
+            "timeout": timeout or self.timeout,
+            "allowed_updates": ["callback_query"]  # 只接收回调查询
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, 
+                                  proxies=proxies, timeout=timeout + 5 if timeout else 15)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("ok"):
+                    updates = result.get("result", [])
+                    if updates:
+                        # 更新offset到最后一个update之后
+                        self.offset = updates[-1]["update_id"] + 1
+                    return updates
+                else:
+                    print(f"获取更新失败: {result.get('description')}")
+                    return []
+            else:
+                print(f"获取更新请求失败，状态码: {response.status_code}")
+                return []
+                
+        except requests.exceptions.Timeout:
+            # 超时是正常的，继续下一次轮询
+            return []
+        except Exception as e:
+            print(f"获取更新出错: {e}")
+            return []
+    
+    def process_updates(self, updates: List[Dict]) -> int:
+        """处理更新列表"""
+        processed_count = 0
+        
+        for update in updates:
+            try:
+                # 只处理callback_query
+                if "callback_query" in update:
+                    callback_query = update["callback_query"]
+                    
+                    # 检查是否是分页相关的回调
+                    callback_data = callback_query.get("data", "")
+                    if callback_data.startswith("page_"):
+                        success = handle_telegram_callback(
+                            self.bot_token, callback_query, self.proxy_url
+                        )
+                        if success:
+                            processed_count += 1
+                            print(f"处理分页回调成功: {callback_data}")
+                        else:
+                            print(f"处理分页回调失败: {callback_data}")
+                    else:
+                        # 非分页回调，回应但不处理
+                        query_id = callback_query.get("id")
+                        if query_id:
+                            answer_callback_query(
+                                self.bot_token, query_id, "⚠️ 未识别的操作", self.proxy_url
+                            )
+                            
+            except Exception as e:
+                print(f"处理更新出错: {e}")
+                continue
+        
+        return processed_count
+    
+    def start_polling(self, max_iterations: int = None) -> None:
+        """开始轮询"""
+        self.is_running = True
+        iteration_count = 0
+        
+        print(f"开始Telegram轮询服务，Bot Token: {self.bot_token[:10]}...")
+        print(f"轮询间隔: {self.polling_interval}秒，长轮询超时: {self.timeout}秒")
+        
+        try:
+            while self.is_running:
+                try:
+                    # 获取更新
+                    updates = self.get_updates()
+                    
+                    if updates:
+                        processed = self.process_updates(updates)
+                        if processed > 0:
+                            print(f"本轮处理了 {processed} 个分页回调")
+                    
+                    # 检查是否达到最大迭代次数
+                    if max_iterations is not None:
+                        iteration_count += 1
+                        if iteration_count >= max_iterations:
+                            print(f"达到最大迭代次数 {max_iterations}，停止轮询")
+                            break
+                    
+                    # 如果没有使用长轮询，则等待一段时间
+                    if self.timeout <= 0:
+                        time.sleep(self.polling_interval)
+                        
+                except KeyboardInterrupt:
+                    print("\n收到中断信号，正在停止轮询...")
+                    break
+                except Exception as e:
+                    print(f"轮询过程中出错: {e}")
+                    time.sleep(5)  # 出错后等待5秒再重试
+                    
+        finally:
+            self.is_running = False
+            print("Telegram轮询服务已停止")
+    
+    def stop_polling(self) -> None:
+        """停止轮询"""
+        self.is_running = False
+        print("正在停止Telegram轮询服务...")
+    
+    def set_polling_config(self, interval: int = None, timeout: int = None) -> None:
+        """设置轮询配置"""
+        if interval is not None:
+            self.polling_interval = max(1, interval)  # 最小1秒
+        if timeout is not None:
+            self.timeout = max(0, timeout)  # 允许0（不使用长轮询）
+
+
+def create_polling_service(bot_token: str = None, proxy_url: str = None) -> Optional[TelegramPollingService]:
+    """创建轮询服务实例"""
+    if not bot_token:
+        # 从配置中获取
+        bot_token = CONFIG.get("TELEGRAM_BOT_TOKEN", "")
+        if not bot_token:
+            print("错误：未找到Telegram Bot Token")
+            return None
+    
+    if proxy_url is None:
+        # 从配置中获取代理设置
+        if CONFIG.get("USE_PROXY", False):
+            proxy_url = CONFIG.get("DEFAULT_PROXY", "")
+    
+    return TelegramPollingService(bot_token, proxy_url)
+
+
+# === Polling 线程管理 ===
+_polling_thread = None
+_polling_service = None
+
+def start_polling_thread(bot_token: str = None, proxy_url: str = None) -> bool:
+    """启动polling线程（后台模式）"""
+    global _polling_thread, _polling_service
+    
+    # 检查是否已经在运行
+    if _polling_thread and _polling_thread.is_alive():
+        print("Polling线程已在运行中")
+        return True
+    
+    # 创建polling服务
+    _polling_service = create_polling_service(bot_token, proxy_url)
+    if not _polling_service:
+        print("无法创建polling服务")
+        return False
+    
+    # 从配置读取轮询设置
+    pagination_config = CONFIG.get("webhooks", {}).get("telegram_pagination", {})
+    interval = pagination_config.get("polling_interval", 2)
+    timeout = pagination_config.get("long_polling_timeout", 10)
+    
+    _polling_service.set_polling_config(interval, timeout)
+    
+    # 启动后台线程
+    import threading
+    _polling_thread = threading.Thread(
+        target=_polling_service.start_polling,
+        name="TelegramPolling",
+        daemon=True  # 守护线程，主程序退出时自动结束
+    )
+    
+    _polling_thread.start()
+    print(f"Telegram Polling线程已启动 (Thread ID: {_polling_thread.ident})")
+    return True
+
+def stop_polling_thread() -> bool:
+    """停止polling线程"""
+    global _polling_thread, _polling_service
+    
+    if _polling_service:
+        _polling_service.stop_polling()
+        _polling_service = None
+    
+    if _polling_thread and _polling_thread.is_alive():
+        # 等待线程结束
+        _polling_thread.join(timeout=5)
+        if _polling_thread.is_alive():
+            print("警告：Polling线程未能正常停止")
+            return False
+        else:
+            print("Polling线程已停止")
+            _polling_thread = None
+            return True
+    
+    return True
+
+def is_polling_running() -> bool:
+    """检查polling是否在运行"""
+    global _polling_thread
+    return _polling_thread and _polling_thread.is_alive()
+
+def get_polling_status() -> Dict:
+    """获取polling状态"""
+    global _polling_thread, _polling_service
+    
+    status = {
+        "thread_running": _polling_thread and _polling_thread.is_alive(),
+        "service_running": _polling_service and _polling_service.is_running if _polling_service else False,
+        "thread_id": _polling_thread.ident if _polling_thread else None,
+        "offset": _polling_service.offset if _polling_service else 0
+    }
+    
+    return status
+
+
 # === 数据获取 ===
 class DataFetcher:
     """数据获取器"""
@@ -4060,6 +4297,13 @@ def send_to_telegram(
             pagination_manager.save_pagination_state(
                 chat_id, message_id, pages, 0, report_type
             )
+            
+            # 检查是否需要自动启动polling
+            if pagination_config.get("auto_start_polling", False):
+                try:
+                    start_polling_thread(bot_token, proxy_url)
+                except Exception as e:
+                    print(f"自动启动polling失败: {e}")
         
         print(f"Telegram分页消息发送完成 [{report_type}]")
         return True
@@ -4959,9 +5203,85 @@ class NewsAnalyzer:
 
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="TrendRadar - 热点新闻聚合分析工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+使用示例:
+  python main.py                    # 正常运行新闻分析
+  python main.py --start-polling    # 运行后启动Telegram polling服务
+  python main.py --polling-only     # 仅启动polling服务，不运行新闻分析
+        """
+    )
+    
+    parser.add_argument(
+        "--start-polling",
+        action="store_true",
+        help="运行分析后启动Telegram polling服务"
+    )
+    
+    parser.add_argument(
+        "--polling-only",
+        action="store_true", 
+        help="仅启动Telegram polling服务，不运行新闻分析"
+    )
+    
+    parser.add_argument(
+        "--bot-token",
+        help="Telegram Bot Token（可选，默认从配置读取）"
+    )
+    
+    args = parser.parse_args()
+    
     try:
-        analyzer = NewsAnalyzer()
-        analyzer.run()
+        if args.polling_only:
+            # 仅启动polling服务
+            print("🔄 启动Telegram Polling服务...")
+            polling_service = create_polling_service(args.bot_token)
+            if polling_service:
+                polling_service.start_polling()
+            else:
+                print("❌ 无法启动polling服务")
+                return
+        else:
+            # 正常运行分析
+            analyzer = NewsAnalyzer()
+            analyzer.run()
+            
+            # 检查是否需要启动polling
+            if args.start_polling:
+                print("\n🔄 启动Telegram Polling服务...")
+                success = start_polling_thread(args.bot_token)
+                if success:
+                    print("✅ Polling服务已在后台启动")
+                    print("💡 提示: 程序将继续运行以保持polling服务活跃")
+                    print("   按 Ctrl+C 停止服务")
+                    
+                    try:
+                        # 保持程序运行
+                        import signal
+                        import time
+                        
+                        def signal_handler(signum, frame):
+                            print("\n正在停止polling服务...")
+                            stop_polling_thread()
+                            print("👋 程序已退出")
+                            exit(0)
+                        
+                        signal.signal(signal.SIGINT, signal_handler)
+                        signal.signal(signal.SIGTERM, signal_handler)
+                        
+                        while is_polling_running():
+                            time.sleep(1)
+                            
+                    except KeyboardInterrupt:
+                        print("\n正在停止polling服务...")
+                        stop_polling_thread()
+                else:
+                    print("❌ Polling服务启动失败")
+                    
     except FileNotFoundError as e:
         print(f"❌ 配置文件错误: {e}")
         print("\n请确保以下文件存在:")

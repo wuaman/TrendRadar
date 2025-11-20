@@ -1,0 +1,43 @@
+[Unit]
+Description=TrendRadar Telegram Polling Service
+Documentation=https://github.com/sansan0/TrendRadar
+After=network-online.target
+Wants=network-online.target
+Requires=trendradar-main.service
+
+[Service]
+Type=exec
+User=trendradar
+Group=trendradar
+WorkingDirectory=/opt/trendradar
+Environment=PYTHONPATH=/opt/trendradar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/trendradar/venv/bin/python telegram_polling_daemon.py
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 资源限制
+MemoryMax=256M
+CPUQuota=50%
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/trendradar/output
+ReadOnlyPaths=/opt/trendradar/config
+
+# 日志设置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trendradar-polling
+
+[Install]
+WantedBy=multi-user.target
