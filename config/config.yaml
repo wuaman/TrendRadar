@@ -74,6 +74,12 @@ notification:
     enabled: true # 是否启用分页功能，false 时使用传统的分批发送
     session_ttl_hours: 1 # 分页会话过期时间（小时）
     max_pages: 20 # 最大分页数量限制
+    
+    # Polling 轮询模式配置（webhook的替代方案）
+    use_polling: true # 是否使用polling模式处理分页按钮，true=polling，false=webhook
+    polling_interval: 2 # 轮询间隔（秒），仅在长轮询超时为0时生效
+    long_polling_timeout: 10 # 长轮询超时时间（秒），0表示不使用长轮询
+    auto_start_polling: false # 发送分页消息后是否自动启动polling（实验性功能）
 
 # 用于让关注度更高的新闻在更前面显示，即用算法重新组合不同平台的热搜排序形成你侧重的热搜，合起来是 1 就行
 weight:
